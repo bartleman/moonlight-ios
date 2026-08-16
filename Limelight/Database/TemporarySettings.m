@@ -44,6 +44,7 @@
     self.multiController = [[NSUserDefaults standardUserDefaults] boolForKey:@"multipleControllers"];
     self.swapABXYButtons = [[NSUserDefaults standardUserDefaults] boolForKey:@"swapABXYButtons"];
     self.btMouseSupport = [[NSUserDefaults standardUserDefaults] boolForKey:@"btMouseSupport"];
+    self.tvosMouseMode = [[NSUserDefaults standardUserDefaults] integerForKey:@"tvosMouseMode"];
     self.statsOverlay = [[NSUserDefaults standardUserDefaults] boolForKey:@"statsOverlay"];
     
     NSInteger _screenSize = [[NSUserDefaults standardUserDefaults] integerForKey:@"streamResolution"];

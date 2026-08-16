@@ -34,6 +34,8 @@
 @property (nonatomic) BOOL btMouseSupport;
 @property (nonatomic) BOOL absoluteTouchMode;
 @property (nonatomic) BOOL statsOverlay;
+// tvOS only: Bluetooth mouse mode (0 = off, 1 = relative, 2 = absolute). Always 0 on non-tvOS.
+@property (nonatomic) NSInteger tvosMouseMode;
 
 - (id) initFromSettings:(Settings*)settings;
 

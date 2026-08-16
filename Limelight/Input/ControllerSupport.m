@@ -19,6 +19,199 @@
 
 static const double MOUSE_SPEED_DIVISOR = 1.25;
 
+#if TARGET_OS_TV
+// ---- tvOS Bluetooth mouse support -------------------------------------------
+//
+// On tvOS the GameController framework never receives mouse Pointer/Scroll/Button
+// HID events: UIKit's private game-controller HID observer filter forwards only
+// keyboard/gamepad/vendor events, so GCMouse handlers never fire for a Bluetooth
+// mouse (verified on-device, tvOS 26.6, and matching every field report + Apple's
+// "pointing devices are not supported on tvOS" stance). However, the RAW HID
+// events DO reach the app process and can be observed via the private
+// -[UIApplication _setHIDEventObserver:onQueue:] hook. We translate them into
+// Moonlight mouse events here.
+//
+// NOTE: this uses private API, so it is tvOS-only and intended for self-signed /
+// sideloaded builds. It must not be proposed for the App Store / upstream build.
+#import <UIKit/UIKit.h>
+#import <dlfcn.h>
+#import <math.h>
+
+typedef struct __IOHIDEvent *MoonlightIOHIDEventRef;
+
+typedef NS_ENUM(NSInteger, MoonlightTVMouseMode) {
+    MoonlightTVMouseModeOff = 0,
+    MoonlightTVMouseModeRelative = 1,
+    MoonlightTVMouseModeAbsolute = 2,
+};
+
+@interface UIApplication (MoonlightTVMouse)
+- (void)_setHIDEventObserver:(void (^)(MoonlightIOHIDEventRef event))observer onQueue:(dispatch_queue_t)queue;
+- (void)_removeHIDEventObserver;
+@end
+
+// Tunables.
+static const double TVMOUSE_MOVE_DIVISOR   = 1.0;    // 1.0 = pass raw HID deltas through
+static const double TVMOUSE_SCROLL_UNITS   = 120.0;  // Windows WHEEL_DELTA per detent
+static const BOOL   TVMOUSE_INVERT_VSCROLL = NO;
+static const BOOL   TVMOUSE_INVERT_HSCROLL = YES;    // horizontal is reversed vs vertical
+
+// IOKit HID accessors, resolved at start time via dlsym (adds no link dependency).
+static uint32_t   (*TVMouse_GetType)(MoonlightIOHIDEventRef) = NULL;
+static CFIndex    (*TVMouse_GetInteger)(MoonlightIOHIDEventRef, uint32_t) = NULL;
+static double     (*TVMouse_GetFloat)(MoonlightIOHIDEventRef, uint32_t) = NULL;
+static CFArrayRef (*TVMouse_GetChildren)(MoonlightIOHIDEventRef) = NULL;
+
+#define TVMOUSE_HID_FIELD_BASE(t) ((uint32_t)((t) << 16))
+#define TVMOUSE_HID_TYPE_POINTER  17
+#define TVMOUSE_HID_TYPE_SCROLL   6
+
+static dispatch_queue_t     g_tvMouseQueue = NULL;
+static MoonlightTVMouseMode g_tvMouseMode = MoonlightTVMouseModeOff;
+static short                g_tvMouseRefW = 1920;
+static short                g_tvMouseRefH = 1080;
+static NSInteger            g_tvMouseLastButtonMask = 0;
+static double               g_tvMouseScrollAccumV = 0;
+static double               g_tvMouseScrollAccumH = 0;
+
+// HID pointer button-mask bit index -> Moonlight button code.
+static int TVMouse_ButtonForBit(int bit) {
+    switch (bit) {
+        case 0: return BUTTON_LEFT;
+        case 1: return BUTTON_RIGHT;
+        case 2: return BUTTON_MIDDLE;
+        case 3: return BUTTON_X1;
+        case 4: return BUTTON_X2;
+        default: return 0;
+    }
+}
+
+static void TVMouse_HandlePointer(MoonlightIOHIDEventRef event) {
+    long dx = TVMouse_GetInteger(event, TVMOUSE_HID_FIELD_BASE(TVMOUSE_HID_TYPE_POINTER) + 0);
+    long dy = TVMouse_GetInteger(event, TVMOUSE_HID_FIELD_BASE(TVMOUSE_HID_TYPE_POINTER) + 1);
+    NSInteger mask = TVMouse_GetInteger(event, TVMOUSE_HID_FIELD_BASE(TVMOUSE_HID_TYPE_POINTER) + 3);
+
+    if (dx != 0 || dy != 0) {
+        short sdx = (short)lround(dx / TVMOUSE_MOVE_DIVISOR);
+        short sdy = (short)lround(dy / TVMOUSE_MOVE_DIVISOR);
+        if (sdx != 0 || sdy != 0) {
+            if (g_tvMouseMode == MoonlightTVMouseModeAbsolute) {
+                LiSendMouseMoveAsMousePositionEvent(sdx, sdy, g_tvMouseRefW, g_tvMouseRefH);
+            } else {
+                LiSendMouseMoveEvent(sdx, sdy);
+            }
+        }
+    }
+
+    if (mask != g_tvMouseLastButtonMask) {
+        NSInteger changed = mask ^ g_tvMouseLastButtonMask;
+        for (int bit = 0; bit < 5; bit++) {
+            if (changed & (1 << bit)) {
+                int button = TVMouse_ButtonForBit(bit);
+                if (button != 0) {
+                    BOOL pressed = (mask & (1 << bit)) != 0;
+                    LiSendMouseButtonEvent(pressed ? BUTTON_ACTION_PRESS : BUTTON_ACTION_RELEASE, button);
+                }
+            }
+        }
+        g_tvMouseLastButtonMask = mask;
+    }
+}
+
+static void TVMouse_HandleScroll(MoonlightIOHIDEventRef event) {
+    double sx = TVMouse_GetFloat(event, TVMOUSE_HID_FIELD_BASE(TVMOUSE_HID_TYPE_SCROLL) + 0);
+    double sy = TVMouse_GetFloat(event, TVMOUSE_HID_FIELD_BASE(TVMOUSE_HID_TYPE_SCROLL) + 1);
+
+    if (sy != 0) {
+        g_tvMouseScrollAccumV += (TVMOUSE_INVERT_VSCROLL ? -sy : sy) * TVMOUSE_SCROLL_UNITS;
+        short amt = (short)g_tvMouseScrollAccumV;
+        if (amt != 0) { LiSendHighResScrollEvent(amt); g_tvMouseScrollAccumV -= amt; }
+    }
+    if (sx != 0) {
+        g_tvMouseScrollAccumH += (TVMOUSE_INVERT_HSCROLL ? -sx : sx) * TVMOUSE_SCROLL_UNITS;
+        short amt = (short)g_tvMouseScrollAccumH;
+        if (amt != 0) { LiSendHighResHScrollEvent(amt); g_tvMouseScrollAccumH -= amt; }
+    }
+}
+
+static void TVMouse_HandleEvent(MoonlightIOHIDEventRef event) {
+    if (event == NULL || TVMouse_GetType == NULL) return;
+    uint32_t type = TVMouse_GetType(event);
+    if (type == TVMOUSE_HID_TYPE_POINTER) {
+        TVMouse_HandlePointer(event);
+    } else if (type == TVMOUSE_HID_TYPE_SCROLL) {
+        TVMouse_HandleScroll(event);
+    }
+    // A pointer event can carry a scroll child; handle it too (button children are
+    // already covered by the parent's button mask).
+    if (TVMouse_GetChildren != NULL) {
+        CFArrayRef kids = TVMouse_GetChildren(event);
+        if (kids != NULL) {
+            for (CFIndex i = 0; i < CFArrayGetCount(kids); i++) {
+                MoonlightIOHIDEventRef child = (MoonlightIOHIDEventRef)CFArrayGetValueAtIndex(kids, i);
+                if (child != NULL && TVMouse_GetType(child) == TVMOUSE_HID_TYPE_SCROLL) {
+                    TVMouse_HandleScroll(child);
+                }
+            }
+        }
+    }
+}
+
+static void TVMouse_Start(MoonlightTVMouseMode mode, short refW, short refH) {
+    if (g_tvMouseQueue != NULL) return;      // already running
+    if (mode == MoonlightTVMouseModeOff) return;
+
+    TVMouse_GetType     = dlsym(RTLD_DEFAULT, "IOHIDEventGetType");
+    TVMouse_GetInteger  = dlsym(RTLD_DEFAULT, "IOHIDEventGetIntegerValue");
+    TVMouse_GetFloat    = dlsym(RTLD_DEFAULT, "IOHIDEventGetFloatValue");
+    TVMouse_GetChildren = dlsym(RTLD_DEFAULT, "IOHIDEventGetChildren");
+    if (TVMouse_GetType == NULL || TVMouse_GetInteger == NULL || TVMouse_GetFloat == NULL) {
+        Log(LOG_W, @"tvOS mouse: could not resolve IOHIDEvent accessors; mouse disabled");
+        return;
+    }
+
+    UIApplication* app = [UIApplication sharedApplication];
+    if (![app respondsToSelector:@selector(_setHIDEventObserver:onQueue:)]) {
+        Log(LOG_W, @"tvOS mouse: _setHIDEventObserver:onQueue: unavailable; mouse disabled");
+        return;
+    }
+
+    g_tvMouseMode = mode;
+    g_tvMouseRefW = refW > 0 ? refW : 1920;
+    g_tvMouseRefH = refH > 0 ? refH : 1080;
+    g_tvMouseLastButtonMask = 0;
+    g_tvMouseScrollAccumV = 0;
+    g_tvMouseScrollAccumH = 0;
+    // Run the HID observer at high QoS so input isn't scheduled behind video decode.
+    dispatch_queue_attr_t queueAttr =
+        dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL, QOS_CLASS_USER_INTERACTIVE, 0);
+    g_tvMouseQueue = dispatch_queue_create("com.moonlight.tvmouse", queueAttr);
+    [app _setHIDEventObserver:^(MoonlightIOHIDEventRef event) {
+        TVMouse_HandleEvent(event);
+    } onQueue:g_tvMouseQueue];
+    Log(LOG_I, @"tvOS Bluetooth mouse enabled (mode=%ld, ref=%dx%d)", (long)mode, refW, refH);
+}
+
+static void TVMouse_Stop(void) {
+    if (g_tvMouseQueue == NULL) return;
+    UIApplication* app = [UIApplication sharedApplication];
+    if ([app respondsToSelector:@selector(_removeHIDEventObserver)]) {
+        [app _removeHIDEventObserver];
+    }
+    // Release any buttons still held on the host.
+    for (int bit = 0; bit < 5; bit++) {
+        if (g_tvMouseLastButtonMask & (1 << bit)) {
+            int button = TVMouse_ButtonForBit(bit);
+            if (button != 0) LiSendMouseButtonEvent(BUTTON_ACTION_RELEASE, button);
+        }
+    }
+    g_tvMouseLastButtonMask = 0;
+    g_tvMouseMode = MoonlightTVMouseModeOff;
+    g_tvMouseQueue = NULL;
+    Log(LOG_I, @"tvOS Bluetooth mouse disabled");
+}
+#endif
+
 @implementation ControllerSupport {
     id _controllerConnectObserver;
     id _controllerDisconnectObserver;
@@ -1088,7 +1281,8 @@ static const double MOUSE_SPEED_DIVISOR = 1.25;
     _oscController.playerIndex = 0;
 
     DataManager* dataMan = [[DataManager alloc] init];
-    _oscEnabled = (OnScreenControlsLevel)[[dataMan getSettings].onscreenControls integerValue] != OnScreenControlsLevelOff;
+    TemporarySettings* settings = [dataMan getSettings];
+    _oscEnabled = (OnScreenControlsLevel)[settings.onscreenControls integerValue] != OnScreenControlsLevelOff;
     
     Log(LOG_I, @"Number of supported controllers connected: %d", [ControllerSupport getGamepadCount]);
     Log(LOG_I, @"Multi-controller: %d", _multiController);
@@ -1108,7 +1302,14 @@ static const double MOUSE_SPEED_DIVISOR = 1.25;
             [self registerMouseCallbacks:mouse];
         }
     }
-    
+
+#if TARGET_OS_TV
+    // GCMouse never receives Bluetooth-mouse events on tvOS, so drive the mouse from
+    // the raw HID stream instead (see the tvOS Bluetooth mouse support section above).
+    TVMouse_Start((MoonlightTVMouseMode)settings.tvosMouseMode,
+                  (short)streamConfig.width, (short)streamConfig.height);
+#endif
+
     _controllerConnectObserver = [[NSNotificationCenter defaultCenter] addObserverForName:GCControllerDidConnectNotification object:nil queue:[NSOperationQueue mainQueue] usingBlock:^(NSNotification *note) {
         Log(LOG_I, @"Controller connected!");
         
@@ -1233,6 +1434,10 @@ static const double MOUSE_SPEED_DIVISOR = 1.25;
 
 -(void) cleanup
 {
+#if TARGET_OS_TV
+    TVMouse_Stop();
+#endif
+
     [[NSNotificationCenter defaultCenter] removeObserver:_controllerConnectObserver];
     [[NSNotificationCenter defaultCenter] removeObserver:_controllerDisconnectObserver];
     [[NSNotificationCenter defaultCenter] removeObserver:_mouseConnectObserver];

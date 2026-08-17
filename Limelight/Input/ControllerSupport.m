@@ -51,7 +51,6 @@ typedef NS_ENUM(NSInteger, MoonlightTVMouseMode) {
 @end
 
 // Tunables.
-static const double TVMOUSE_MOVE_DIVISOR   = 1.0;    // 1.0 = pass raw HID deltas through
 static const double TVMOUSE_SCROLL_UNITS   = 120.0;  // Windows WHEEL_DELTA per detent
 static const BOOL   TVMOUSE_INVERT_VSCROLL = NO;
 static const BOOL   TVMOUSE_INVERT_HSCROLL = YES;    // horizontal is reversed vs vertical
@@ -73,6 +72,7 @@ static short                g_tvMouseRefH = 1080;
 static NSInteger            g_tvMouseLastButtonMask = 0;
 static double               g_tvMouseScrollAccumV = 0;
 static double               g_tvMouseScrollAccumH = 0;
+static double               g_tvMouseSensitivity = 1.0;  // user multiplier on relative HID deltas (1.0 = raw)
 
 // HID pointer button-mask bit index -> Moonlight button code.
 static int TVMouse_ButtonForBit(int bit) {
@@ -92,8 +92,14 @@ static void TVMouse_HandlePointer(MoonlightIOHIDEventRef event) {
     NSInteger mask = TVMouse_GetInteger(event, TVMOUSE_HID_FIELD_BASE(TVMOUSE_HID_TYPE_POINTER) + 3);
 
     if (dx != 0 || dy != 0) {
-        short sdx = (short)lround(dx / TVMOUSE_MOVE_DIVISOR);
-        short sdy = (short)lround(dy / TVMOUSE_MOVE_DIVISOR);
+        // Apply the user sensitivity multiplier, clamped to the int16 range that
+        // LiSendMouseMoveEvent accepts (guards against overflow on fast flicks).
+        long rdx = lround(dx * g_tvMouseSensitivity);
+        long rdy = lround(dy * g_tvMouseSensitivity);
+        if (rdx > 32767) rdx = 32767; else if (rdx < -32767) rdx = -32767;
+        if (rdy > 32767) rdy = 32767; else if (rdy < -32767) rdy = -32767;
+        short sdx = (short)rdx;
+        short sdy = (short)rdy;
         if (sdx != 0 || sdy != 0) {
             if (g_tvMouseMode == MoonlightTVMouseModeAbsolute) {
                 LiSendMouseMoveAsMousePositionEvent(sdx, sdy, g_tvMouseRefW, g_tvMouseRefH);
@@ -157,7 +163,7 @@ static void TVMouse_HandleEvent(MoonlightIOHIDEventRef event) {
     }
 }
 
-static void TVMouse_Start(MoonlightTVMouseMode mode, short refW, short refH) {
+static void TVMouse_Start(MoonlightTVMouseMode mode, short refW, short refH, double sensitivity) {
     if (g_tvMouseQueue != NULL) return;      // already running
     if (mode == MoonlightTVMouseModeOff) return;
 
@@ -177,6 +183,7 @@ static void TVMouse_Start(MoonlightTVMouseMode mode, short refW, short refH) {
     }
 
     g_tvMouseMode = mode;
+    g_tvMouseSensitivity = sensitivity > 0 ? sensitivity : 1.0;  // guard unset/0 (would freeze cursor)
     g_tvMouseRefW = refW > 0 ? refW : 1920;
     g_tvMouseRefH = refH > 0 ? refH : 1080;
     g_tvMouseLastButtonMask = 0;
@@ -189,7 +196,7 @@ static void TVMouse_Start(MoonlightTVMouseMode mode, short refW, short refH) {
     [app _setHIDEventObserver:^(MoonlightIOHIDEventRef event) {
         TVMouse_HandleEvent(event);
     } onQueue:g_tvMouseQueue];
-    Log(LOG_I, @"tvOS Bluetooth mouse enabled (mode=%ld, ref=%dx%d)", (long)mode, refW, refH);
+    Log(LOG_I, @"tvOS Bluetooth mouse enabled (mode=%ld, ref=%dx%d, sensitivity=%.2f)", (long)mode, refW, refH, g_tvMouseSensitivity);
 }
 
 static void TVMouse_Stop(void) {
@@ -1307,7 +1314,8 @@ static void TVMouse_Stop(void) {
     // GCMouse never receives Bluetooth-mouse events on tvOS, so drive the mouse from
     // the raw HID stream instead (see the tvOS Bluetooth mouse support section above).
     TVMouse_Start((MoonlightTVMouseMode)settings.tvosMouseMode,
-                  (short)streamConfig.width, (short)streamConfig.height);
+                  (short)streamConfig.width, (short)streamConfig.height,
+                  settings.tvosMouseSensitivity);
 #endif
 
     _controllerConnectObserver = [[NSNotificationCenter defaultCenter] addObserverForName:GCControllerDidConnectNotification object:nil queue:[NSOperationQueue mainQueue] usingBlock:^(NSNotification *note) {

@@ -36,6 +36,8 @@
 @property (nonatomic) BOOL statsOverlay;
 // tvOS only: Bluetooth mouse mode (0 = off, 1 = relative, 2 = absolute). Always 0 on non-tvOS.
 @property (nonatomic) NSInteger tvosMouseMode;
+// tvOS only: Bluetooth mouse sensitivity multiplier (1.0 = raw HID deltas). 0 on non-tvOS.
+@property (nonatomic) float tvosMouseSensitivity;
 
 - (id) initFromSettings:(Settings*)settings;
 

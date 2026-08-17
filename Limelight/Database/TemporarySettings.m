@@ -45,6 +45,7 @@
     self.swapABXYButtons = [[NSUserDefaults standardUserDefaults] boolForKey:@"swapABXYButtons"];
     self.btMouseSupport = [[NSUserDefaults standardUserDefaults] boolForKey:@"btMouseSupport"];
     self.tvosMouseMode = [[NSUserDefaults standardUserDefaults] integerForKey:@"tvosMouseMode"];
+    self.tvosMouseSensitivity = [[NSUserDefaults standardUserDefaults] floatForKey:@"tvosMouseSensitivity"];
     self.statsOverlay = [[NSUserDefaults standardUserDefaults] boolForKey:@"statsOverlay"];
     
     NSInteger _screenSize = [[NSUserDefaults standardUserDefaults] integerForKey:@"streamResolution"];

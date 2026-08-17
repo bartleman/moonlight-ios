@@ -239,6 +239,8 @@
 			<string>PSGroupSpecifier</string>
 			<key>Title</key>
 			<string>Video Options</string>
+			<key>FooterText</key>
+			<string>Video Super Resolution uses MetalFX to upscale streams that are lower resolution than your display (for example 1080p to 4K). It only helps when you stream below your display's native resolution, and it can add input latency. Leave it off when streaming at native 4K — it provides no benefit there and may slow things down.</string>
 		</dict>
 		<dict>
 			<key>Type</key>
